@@ -1,0 +1,56 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "P2P地震情報 WebSocket",
+        "description": "緊急地震速報（警報）を受信したら p2pquake_eew イベントを発火します。動作確認にはサンドボックスを選んでください。",
+        "data": {
+          "endpoint": "接続先"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "P2P地震情報 WebSocket はすでに追加されています。追加できるのは1つだけです。"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "endpoint": "接続先"
+        }
+      }
+    }
+  },
+  "selector": {
+    "endpoint": {
+      "options": {
+        "production": "本番（実際の情報）",
+        "sandbox": "サンドボックス（2023年の情報を再送・動作確認用）"
+      }
+    }
+  },
+  "device": {
+    "service": {
+      "name": "P2P地震情報 WebSocket"
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "connected": {
+        "name": "接続状態"
+      }
+    },
+    "sensor": {
+      "last_eew": {
+        "name": "最終緊急地震速報"
+      }
+    }
+  },
+  "issues": {
+    "sandbox_endpoint": {
+      "title": "P2P地震情報 WebSocket がサンドボックスに接続しています",
+      "description": "動作確認用のサンドボックスは2023年の速報を再送しており、本物の緊急地震速報は届きません。確認が終わったら、統合の設定で接続先を「本番」に戻してください。"
+    }
+  }
+}

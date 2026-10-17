@@ -1,0 +1,56 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "P2PQuake WebSocket",
+        "description": "Fires the p2pquake_eew event when an Earthquake Early Warning (code 556) is received. Choose the sandbox to test.",
+        "data": {
+          "endpoint": "Endpoint"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "P2PQuake WebSocket is already configured. Only one instance is allowed."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "endpoint": "Endpoint"
+        }
+      }
+    }
+  },
+  "selector": {
+    "endpoint": {
+      "options": {
+        "production": "Production (live data)",
+        "sandbox": "Sandbox (replays 2023 data, for testing)"
+      }
+    }
+  },
+  "device": {
+    "service": {
+      "name": "P2PQuake WebSocket"
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "connected": {
+        "name": "Connected"
+      }
+    },
+    "sensor": {
+      "last_eew": {
+        "name": "Last EEW"
+      }
+    }
+  },
+  "issues": {
+    "sandbox_endpoint": {
+      "title": "P2PQuake WebSocket is connected to the sandbox",
+      "description": "The sandbox replays 2023 data and does not deliver real Earthquake Early Warnings. Switch the endpoint back to production in the integration options when you finish testing."
+    }
+  }
+}

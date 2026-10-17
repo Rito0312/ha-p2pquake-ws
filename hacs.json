@@ -1,0 +1,5 @@
+{
+  "name": "P2P地震情報 WebSocket",
+  "render_readme": true,
+  "homeassistant": "2025.2.0"
+}
