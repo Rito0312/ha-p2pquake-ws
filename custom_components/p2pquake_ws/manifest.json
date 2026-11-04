@@ -1,0 +1,13 @@
+{
+  "domain": "p2pquake_ws",
+  "name": "P2P地震情報 WebSocket",
+  "codeowners": ["@Rito0312"],
+  "config_flow": true,
+  "documentation": "https://github.com/Rito0312/ha-p2pquake-ws",
+  "integration_type": "service",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/Rito0312/ha-p2pquake-ws/issues",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "0.1.0"
+}

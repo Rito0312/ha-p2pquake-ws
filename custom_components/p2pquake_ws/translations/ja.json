@@ -1,0 +1,79 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "P2P地震情報 WebSocket",
+        "description": "緊急地震速報（警報）を受信したら p2pquake_eew イベントを、地震情報（震度・震源の情報）を受信したら p2pquake_quake イベントを発火します。動作確認にはサンドボックスを選んでください。",
+        "data": {
+          "endpoint": "接続先"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "P2P地震情報 WebSocket はすでに追加されています。追加できるのは1つだけです。"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "endpoint": "接続先",
+          "image": "画像を作る",
+          "home_area": "自宅の地域（細分区域）"
+        },
+        "data_description": {
+          "image": "緊急地震速報を受信するたびに image.p2pquake_ws_eew_map を、地震情報（震度・震源の情報）を受信するたびに image.p2pquake_ws_quake_map を作ります（どちらも 1280×800 の PNG）。イベントを発火した後で作るので、イベントが遅れることはありません。",
+          "home_area": "画像に大きく出す地域（緊急地震速報では予想震度と揺れの到達予想時刻、地震情報では観測された震度）。空欄なら、震度の大きい地域を並べます。"
+        }
+      }
+    }
+  },
+  "selector": {
+    "endpoint": {
+      "options": {
+        "production": "本番（実際の情報）",
+        "sandbox": "サンドボックス（2023年の情報を再送・動作確認用）"
+      }
+    }
+  },
+  "device": {
+    "service": {
+      "name": "P2P地震情報 WebSocket"
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "connected": {
+        "name": "接続状態"
+      }
+    },
+    "button": {
+      "test_image": {
+        "name": "テスト画像を作る"
+      }
+    },
+    "image": {
+      "eew_map": {
+        "name": "緊急地震速報の画像"
+      },
+      "quake_map": {
+        "name": "地震情報の画像"
+      }
+    },
+    "sensor": {
+      "last_eew": {
+        "name": "最終緊急地震速報"
+      }
+    }
+  },
+  "issues": {
+    "sandbox_endpoint": {
+      "title": "P2P地震情報 WebSocket がサンドボックスに接続しています",
+      "description": "動作確認用のサンドボックスは2023年の速報を再送しており、本物の緊急地震速報は届きません。確認が終わったら、統合の設定で接続先を「本番」に戻してください。"
+    },
+    "image_assets": {
+      "title": "画像用のファイルを読み込めません",
+      "description": "地図・観測点の対応表・フォントのファイルを読み込めなかったため、画像（image.p2pquake_ws_eew_map など）を作っていません。緊急地震速報と地震情報のイベントは通常どおり発火します。HACS で統合をダウンロードし直してから、Home Assistant を再起動してください。"
+    }
+  }
+}

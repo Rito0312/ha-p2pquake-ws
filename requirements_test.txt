@@ -1,0 +1,6 @@
+# tests/test_client.py に必要なもの
+aiohttp
+pytest
+pytest-asyncio
+# tests/test_integration.py に必要なもの（HA 本体を含む。HA のバージョンに合わせて選ぶ）
+pytest-homeassistant-custom-component

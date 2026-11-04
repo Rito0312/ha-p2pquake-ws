@@ -1,0 +1,79 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "P2PQuake WebSocket",
+        "description": "Fires the p2pquake_eew event when an Earthquake Early Warning (code 556) is received, and the p2pquake_quake event for earthquake information (code 551). Choose the sandbox to test.",
+        "data": {
+          "endpoint": "Endpoint"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "P2PQuake WebSocket is already configured. Only one instance is allowed."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "endpoint": "Endpoint",
+          "image": "Create images",
+          "home_area": "Your area (JMA subdivision area)"
+        },
+        "data_description": {
+          "image": "Creates image.p2pquake_ws_eew_map for each EEW and image.p2pquake_ws_quake_map for each earthquake information message (1280x800 PNG). Images are made after the event is fired, so events are never delayed.",
+          "home_area": "Area shown large on the image (forecast intensity and arrival time for EEW, observed intensity for earthquake information). If empty, the areas with the strongest shaking are listed."
+        }
+      }
+    }
+  },
+  "selector": {
+    "endpoint": {
+      "options": {
+        "production": "Production (live data)",
+        "sandbox": "Sandbox (replays 2023 data, for testing)"
+      }
+    }
+  },
+  "device": {
+    "service": {
+      "name": "P2PQuake WebSocket"
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "connected": {
+        "name": "Connected"
+      }
+    },
+    "button": {
+      "test_image": {
+        "name": "Make test image"
+      }
+    },
+    "image": {
+      "eew_map": {
+        "name": "EEW map"
+      },
+      "quake_map": {
+        "name": "Earthquake information map"
+      }
+    },
+    "sensor": {
+      "last_eew": {
+        "name": "Last EEW"
+      }
+    }
+  },
+  "issues": {
+    "sandbox_endpoint": {
+      "title": "P2PQuake WebSocket is connected to the sandbox",
+      "description": "The sandbox replays 2023 data and does not deliver real Earthquake Early Warnings. Switch the endpoint back to production in the integration options when you finish testing."
+    },
+    "image_assets": {
+      "title": "Image files could not be loaded",
+      "description": "The map, observation-point table or font files could not be loaded, so no images (image.p2pquake_ws_eew_map etc.) are being created. EEW and earthquake information events are still fired as usual. Re-download the integration in HACS and restart Home Assistant."
+    }
+  }
+}
