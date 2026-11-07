@@ -443,12 +443,37 @@ async def test_run_stops_both_loops_if_one_dies():
     assert other_cancelled.is_set()  # 管理外のループが残らない
 
 
-def test_resumed_setup_uses_normal_age_rule():
-    """再読み込み（記録を引き継いだ）なら、setup 直前の隙に出た速報も拾う."""
+def test_resumed_setup_picks_up_only_the_reload_gap():
+    """読み込み直しなら、unload 以降（隙間）に出た速報だけを通常の年齢判定で拾う."""
     now = SETUP + timedelta(seconds=30)
-    p, rec, _ = make(now, resumed=True)
-    p.process(556, [eew("e1", SETUP - timedelta(seconds=20)), eew("e0", SETUP - timedelta(seconds=700))])
-    assert rec.got == [("e1", "rest")]
+    unloaded = SETUP - timedelta(seconds=5)
+    p, rec, _ = make(now, resumed_since=unloaded)
+    p.process(
+        556,
+        [
+            eew("gap", SETUP - timedelta(seconds=3)),  # 隙間に出た
+            eew("before", SETUP - timedelta(seconds=120)),  # unload より前（従来どおり見送り）
+        ],
+    )
+    assert rec.got == [("gap", "rest")]
+
+
+def test_skip_state_is_shared_across_instances():
+    """見送りの記録と地震情報の最新時刻は、渡された入れ物に残る（読み込み直しで取り消されない）."""
+    skipped, state = Deduplicator(size=200), {}
+    now = SETUP + timedelta(minutes=5)
+    p1, rec1, _ = make(now, startup=True, skipped=skipped, quake_state=state)
+    p1.process(556, [eew("old", SETUP - timedelta(seconds=240))])
+    p1.note_quake(quake("q9", SETUP + timedelta(minutes=4)))
+    assert rec1.got == []
+
+    later = now + timedelta(minutes=4)
+    p2, rec2, _ = make(later, resumed_since=later - timedelta(seconds=2), skipped=skipped, quake_state=state)
+    p2._setup_at = later
+    p2.process(556, [eew("old", SETUP - timedelta(seconds=240))])
+    p2.process(551, [quake("q1", SETUP + timedelta(minutes=1))])
+    assert rec2.got == []
+    assert p2.last_quake_time == SETUP + timedelta(minutes=4)
 
 
 def test_older_quake_is_not_shown_after_newer_one():

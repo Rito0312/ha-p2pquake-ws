@@ -45,6 +45,10 @@ STARTUP_EEW_MAX_AGE = 180.0
 # setup 以降でも、これより古い情報は発火しない（障害から戻ったときに古い情報を流さない）
 MAX_AGE = {556: 600.0, 551: 1800.0}
 CLOCK_SKEW_WARN = 120.0
+# 読み込み直しの隙に出た情報として扱う範囲を、unload の時刻より少し前まで広げる（P2P の time との差）
+RESUME_MARGIN = timedelta(seconds=10)
+# unload からこの秒数以内の setup だけを「読み込み直し」とみなす（無効化して何時間も後に有効化した場合は除く）
+RESUME_WITHIN = 60.0
 
 
 def parse_time(value: Any) -> datetime | None:
@@ -86,7 +90,9 @@ class P2PQuakePoller:
         *,
         setup_at: datetime,
         setup_during_startup: bool,
-        resumed: bool = False,
+        resumed_since: datetime | None = None,
+        skipped: Deduplicator | None = None,
+        quake_state: dict[str, Any] | None = None,
         quake_ready: Callable[[], Awaitable[None]] | None = None,
         on_status: Callable[[], None] | None = None,
         now: Callable[[], datetime] | None = None,
@@ -98,12 +104,15 @@ class P2PQuakePoller:
         self._ingest = ingest
         self._setup_at = setup_at
         self._setup_during_startup = setup_during_startup
-        # 重複除去の記録を引き継いだ（オプション変更での読み込み直し）。setup 前の情報も通常の年齢判定にする
-        self._resumed = resumed
-        # REST で発火を見送った要素（Ingest には記録しない。WS で後から届いた同じ情報は止めない）
-        self._skipped = Deduplicator(size=200)
+        # 直前の unload の時刻（オプション変更での読み込み直しのときだけ）。
+        # setup 前の情報のうち、この時刻以降のもの（読み込み直しの隙に出たもの）だけ通常の年齢判定にする
+        self._resumed_since = resumed_since
+        # REST で発火を見送った要素（Ingest には記録しない。WS で後から届いた同じ情報は止めない）。
+        # 読み込み直しで見送りが取り消されないよう、呼び出し側が hass.data に置いたものを渡す
+        self._skipped = skipped if skipped is not None else Deduplicator(size=200)
+        # 発火済みの 551 の最新の time（古い報を後から出さない）。同じく読み込み直しをまたいで残す
+        self._quake_state = quake_state if quake_state is not None else {}
         self._time_warned = False
-        self.last_quake_time: datetime | None = None  # 発火済みの 551 の最新の time（古い報を後から出さない）
         self._quake_ready = quake_ready
         self._on_status = on_status
         self._now = now or (lambda: datetime.now(timezone.utc))
@@ -115,6 +124,10 @@ class P2PQuakePoller:
         self._skew_warned = False
         self.last_success: float | None = None  # 556 の取得が最後に成功した時刻（monotonic）
         self.alive = True  # 取得タスクが動いているか（予期せず終わったら False）
+
+    @property
+    def last_quake_time(self) -> datetime | None:
+        return self._quake_state.get("last_time")
 
     @property
     def stopped(self) -> bool:
@@ -270,7 +283,8 @@ class P2PQuakePoller:
                 _LOGGER.warning(
                     "P2P の時刻が HA の時計より %.0f 秒進んでいます。HA の時計を確認してください", -age
                 )
-            if when < self._setup_at and not self._resumed:
+            in_gap = self._resumed_since is not None and when >= self._resumed_since - RESUME_MARGIN
+            if when < self._setup_at and not in_gap:
                 fire = (
                     code == 556
                     and self._setup_during_startup
@@ -297,7 +311,7 @@ class P2PQuakePoller:
         """551 が発火した（WS・REST どちらでも）。その time を覚える."""
         when = parse_time(data.get("time"))
         if when is not None and (self.last_quake_time is None or when > self.last_quake_time):
-            self.last_quake_time = when
+            self._quake_state["last_time"] = when
 
 
 def _retry_after(value: str | None) -> float:

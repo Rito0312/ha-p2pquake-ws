@@ -29,7 +29,7 @@ from homeassistant.util import dt as dt_util
 from . import render
 from .client import Deduplicator, P2PQuakeClient, message_id
 from .ingest import SOURCE_WS, Ingest
-from .poller import P2PQuakePoller, parse_time
+from .poller import RESUME_WITHIN, P2PQuakePoller, parse_time
 from .const import (
     CODE_EEW,
     CODE_QUAKE,
@@ -244,9 +244,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: P2PQuakeConfigEntry) -> 
     # 重複除去の記録と、緊急地震速報の serial は、再読み込み（オプション変更）をまたいで残す
     # （同じ速報を二重に発火しない。古い報で画像を戻さない）
     domain_data = hass.data.setdefault(DOMAIN, {})
-    resumed = "dedup" in domain_data
     dedup = domain_data.setdefault("dedup", Deduplicator())
     eew_serials = domain_data.setdefault("eew_serials", {})
+    # REST で見送った要素と、発火済みの地震情報の最新時刻も引き継ぐ（読み込み直しで見送りが取り消されない）
+    skipped = domain_data.setdefault("rest_skipped", Deduplicator(size=200))
+    quake_state = domain_data.setdefault("quake_state", {})
+    # 直前の unload から間もない setup（オプション変更での読み込み直し）なら、その隙に出た情報を拾う
+    unloaded_at = domain_data.pop("unloaded_at", None)
+    resumed_since = (
+        unloaded_at
+        if unloaded_at is not None
+        and (dt_util.utcnow() - unloaded_at).total_seconds() <= RESUME_WITHIN
+        else None
+    )
     ingest = Ingest(dedup, _on_message, _on_new)
 
     session = async_get_clientsession(hass)
@@ -278,7 +288,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: P2PQuakeConfigEntry) -> 
             ingest,
             setup_at=dt_util.utcnow(),
             setup_during_startup=hass.state is not CoreState.running,
-            resumed=resumed,
+            resumed_since=resumed_since,
+            skipped=skipped,
+            quake_state=quake_state,
             quake_ready=_quake_ready,
             on_status=_on_rest_status,
         )
@@ -358,6 +370,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: P2PQuakeConfigEntry) -> 
             _LOGGER.error(
                 "JSON API の取得タスクが予期せず終了しました。予備の受信ができません: %r",
                 t.exception(),
+                exc_info=t.exception(),
             )
             poller.alive = False
             async_dispatcher_send(hass, SIGNAL_REST)
@@ -385,6 +398,8 @@ async def _async_reload(hass: HomeAssistant, entry: P2PQuakeConfigEntry) -> None
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: P2PQuakeConfigEntry) -> bool:
+    # 次の setup が「読み込み直し」かどうか（隙に出た情報を拾うか）の判定に使う
+    hass.data.setdefault(DOMAIN, {})["unloaded_at"] = dt_util.utcnow()
     # 無効化・削除・再読み込みのどれでも警告を消す（再読み込みなら setup で作り直される）
     ir.async_delete_issue(hass, DOMAIN, ISSUE_SANDBOX)
     ir.async_delete_issue(hass, DOMAIN, ISSUE_ASSETS)

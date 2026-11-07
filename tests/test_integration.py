@@ -940,3 +940,73 @@ async def test_real_poller_loop_wiring(hass: HomeAssistant):
         assert [e.data["_message_id"] for e in events] == ["fresh"]
         assert entry.runtime_data.poller.last_success is not None
         assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_reload_does_not_fire_items_skipped_at_startup(hass: HomeAssistant):
+    """起動時に見送った古い速報（4分前）と地震情報が、5分後の設定変更（読み込み直し）で発火しない.
+
+    （再レビューで見つかった誤報の経路。見送りの記録を読み込み直しで引き継ぐ）
+    """
+    from datetime import timedelta
+
+    from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+    from homeassistant.core import CoreState
+    from homeassistant.util import dt as dt_util
+
+    from custom_components.p2pquake_ws.const import EVENT_QUAKE
+
+    hass.set_state(CoreState.starting)
+    entry = _entry(hass)
+    eews = async_capture_events(hass, EVENT_EEW)
+    quakes = async_capture_events(hass, EVENT_QUAKE)
+    old_eew = _rest_eew("e_pre", ago=240)
+    old_quake = {"id": "q_pre", "code": 551, "time": _p2p_now(300), "issue": {"type": "DetailScale"},
+                 "earthquake": {"maxScale": 10}, "points": []}
+    with patch("custom_components.p2pquake_ws.client.P2PQuakeClient.run", _never):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        poller = entry.runtime_data.poller
+        poller.process(556, [old_eew])
+        hass.set_state(CoreState.running)
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+        await hass.async_block_till_done()
+        poller.process(551, [old_quake])
+        assert eews == [] and quakes == []
+
+        # 5分後に読み込み直し（P2P の時刻も5分進める）
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+        poller2 = entry.runtime_data.poller
+        assert poller2 is not poller and poller2._resumed_since is not None
+        later = dt_util.utcnow() + timedelta(minutes=5)
+        poller2._now = lambda: later
+        poller2.process(556, [old_eew])
+        poller2.process(551, [old_quake])
+        await hass.async_block_till_done()
+        assert eews == [] and quakes == []
+
+        # 隙間に出た速報は拾う
+        gap = _rest_eew("e_gap", ago=0)
+        poller2._now = dt_util.utcnow
+        poller2.process(556, [gap])
+        await hass.async_block_till_done()
+        assert [e.data["_message_id"] for e in eews] == ["e_gap"]
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_late_reenable_is_not_treated_as_reload(hass: HomeAssistant, freezer):
+    """無効化して何時間も後に有効化した場合は「読み込み直し」とみなさない."""
+    from datetime import timedelta
+
+    entry = _entry(hass)
+    with patch("custom_components.p2pquake_ws.client.P2PQuakeClient.run", _never):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert entry.runtime_data.poller._resumed_since is None  # 初回
+        assert await hass.config_entries.async_unload(entry.entry_id)
+        await hass.async_block_till_done()
+        freezer.tick(timedelta(hours=3))
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert entry.runtime_data.poller._resumed_since is None
+        assert await hass.config_entries.async_unload(entry.entry_id)
