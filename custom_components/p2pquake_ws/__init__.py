@@ -3,6 +3,9 @@
 緊急地震速報（警報, code 556）を受信したら、受信した JSON をそのまま
 `p2pquake_eew` イベントとして発火する。地震情報（code 551）は `p2pquake_quake` イベント。
 判定や機器の操作はしない。
+
+受信経路は WebSocket（client.py）と、その予備の JSON API（poller.py、本番のみ）。
+どちらで届いても ingest.py で重複を除き、同じ処理を通す（イベントの `_source` で区別できる）。
 """
 from __future__ import annotations
 
@@ -24,7 +27,9 @@ from homeassistant.helpers.start import async_at_started
 from homeassistant.util import dt as dt_util
 
 from . import render
-from .client import P2PQuakeClient, message_id
+from .client import Deduplicator, P2PQuakeClient, message_id
+from .ingest import SOURCE_WS, Ingest
+from .poller import P2PQuakePoller, parse_time
 from .const import (
     CODE_EEW,
     CODE_QUAKE,
@@ -38,6 +43,7 @@ from .const import (
     ENDPOINT_URLS,
     EVENT_EEW,
     EVENT_QUAKE,
+    SIGNAL_REST,
     SIGNAL_UPDATE,
 )
 
@@ -55,10 +61,16 @@ ISSUE_ASSETS = "image_assets"
 IMAGE_ENTITY_KEYS = (("image", "eew_map"), ("image", "quake_map"), ("button", "test_image"))
 
 
+# 緊急地震速報の eventId ごとに覚える最大の serial（古い報が後から届いたら画像などを戻さない）
+EEW_SERIALS_MAX = 20
+
+
 @dataclass
 class RuntimeData:
     client: P2PQuakeClient
     endpoint: str
+    poller: P2PQuakePoller | None = None
+    eew_serials: dict[str, int] = field(default_factory=dict)
     last_eew_at: datetime | None = None
     last_eew: dict[str, Any] | None = None
     pending: list[tuple[datetime, dict[str, Any]]] = field(default_factory=list)
@@ -88,41 +100,70 @@ async def async_setup_entry(hass: HomeAssistant, entry: P2PQuakeConfigEntry) -> 
     def _fire(event_data: dict[str, Any]) -> None:
         hass.bus.async_fire(EVENT_EEW, event_data)
 
+    def _base_event_data(data: dict[str, Any], source: str, now: datetime) -> dict[str, Any]:
+        event_data = dict(data)
+        event_data["_received_at"] = now.isoformat()
+        event_data["_message_id"] = message_id(data)
+        event_data["_endpoint"] = endpoint
+        event_data["_source"] = source
+        # P2P が情報を受け付けた時刻から HA が受け取るまでの秒数（遅れの確認用）
+        if (p2p_time := parse_time(data.get("time"))) is not None:
+            event_data["_p2p_delay"] = round((now - p2p_time).total_seconds(), 1)
+        return event_data
+
+    def _eew_is_stale(data: dict[str, Any]) -> bool:
+        """同じ地震の、既に受け取った報より古い報か（WS と REST で順番が入れ替わった場合）."""
+        issue = data.get("issue")
+        if not isinstance(issue, dict) or not issue.get("eventId"):
+            return False
+        try:
+            serial = int(str(issue.get("serial")))
+        except ValueError:
+            return False
+        key = str(issue["eventId"])
+        seen = runtime.eew_serials.get(key)
+        if seen is not None and serial < seen:
+            return True
+        runtime.eew_serials.pop(key, None)
+        runtime.eew_serials[key] = serial if seen is None else max(seen, serial)
+        while len(runtime.eew_serials) > EEW_SERIALS_MAX:
+            runtime.eew_serials.pop(next(iter(runtime.eew_serials)))
+        return False
+
     @callback
-    def _on_message(data: dict[str, Any]) -> None:
+    def _on_message(data: dict[str, Any], source: str) -> None:
         code = data.get("code")
         if code == CODE_QUAKE:
-            _on_quake(data)
+            _on_quake(data, source)
             return
         # 556・551 以外（ピア分布・揺れた報告など）はエンティティを更新しない
         # （HA のデータベースに書き込まない）
         if code != CODE_EEW:
             return
         now = dt_util.utcnow()
-        runtime.last_eew_at = now
-        runtime.last_eew = data
-        event_data = dict(data)
-        event_data["_received_at"] = now.isoformat()
-        event_data["_message_id"] = message_id(data)
-        event_data["_endpoint"] = endpoint
+        stale = _eew_is_stale(data)
+        event_data = _base_event_data(data, source, now)
         if hass.state is CoreState.running:
             _fire(event_data)
         else:
             _LOGGER.warning("HA の起動完了前に緊急地震速報を受信したため、起動後に発火します")
             runtime.pending.append((now, event_data))
+        if stale:
+            # 発火はする（オートメーションは eventId で1回だけ動く）が、画像と最終速報は新しい報のまま
+            _LOGGER.debug("古い報が後から届きました（%s）: %s", source, event_data["_message_id"])
+            return
+        runtime.last_eew_at = now
+        runtime.last_eew = data
         async_dispatcher_send(hass, SIGNAL_UPDATE)
         # 画像はイベントを発火した後で作る（作成に失敗・遅延してもイベントには影響しない）
         _render_eew(data)
 
     @callback
-    def _on_quake(data: dict[str, Any]) -> None:
+    def _on_quake(data: dict[str, Any], source: str) -> None:
         # 地震情報は起動中に受信しても保留しない（警報ではないため）
         if hass.state is not CoreState.running:
             return
-        event_data = dict(data)
-        event_data["_received_at"] = dt_util.utcnow().isoformat()
-        event_data["_message_id"] = message_id(data)
-        event_data["_endpoint"] = endpoint
+        event_data = _base_event_data(data, source, dt_util.utcnow())
         # 観測点を細分区域ごとにまとめた最大震度（オートメーションの条件に使える）
         # 対応表を読めていないときは空にする（イベントループでファイルを読まない・例外で止めない）
         scales: dict[str, int] = {}
@@ -181,8 +222,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: P2PQuakeConfigEntry) -> 
             else:
                 _LOGGER.warning("起動中に受信した古い速報を破棄: %s", event_data.get("_message_id"))
 
+    started = asyncio.Event()
+
     @callback
     def _on_started(_hass: HomeAssistant) -> None:
+        started.set()
         # オートメーションのトリガー取り付けも起動完了時に行われるため、少し待ってから発火する
         entry.async_on_unload(async_call_later(hass, STARTUP_FLUSH_DELAY, _flush_pending))
 
@@ -190,8 +234,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: P2PQuakeConfigEntry) -> 
     def _on_status(_connected: bool) -> None:
         async_dispatcher_send(hass, SIGNAL_UPDATE)
 
+    @callback
+    def _on_new(_data: dict[str, Any], _source: str) -> None:
+        if runtime.poller is not None:
+            runtime.poller.notify_activity()
+
+    # 重複除去の記録は再読み込み（オプション変更）をまたいで残す（同じ速報を二重に発火しない）
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    dedup = domain_data.setdefault("dedup", Deduplicator())
+    ingest = Ingest(dedup, _on_message, _on_new)
+
+    session = async_get_clientsession(hass)
     client = P2PQuakeClient(
-        async_get_clientsession(hass), url, _on_message, _on_status
+        session, url, lambda data: ingest.handle(data, SOURCE_WS), _on_status
     )
     image_option = bool(entry.options.get(CONF_IMAGE, DEFAULT_IMAGE))
     runtime = RuntimeData(
@@ -202,6 +257,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: P2PQuakeConfigEntry) -> 
         home_area=str(entry.options.get(CONF_HOME_AREA) or ""),
     )
     runtime.render_eew = _render_eew
+    if endpoint == ENDPOINT_PRODUCTION:
+        # サンドボックスには JSON API の過去データが無いので、本番のときだけ動かす
+
+        async def _quake_ready() -> None:
+            await started.wait()
+
+        @callback
+        def _on_rest_status() -> None:
+            async_dispatcher_send(hass, SIGNAL_REST)
+
+        runtime.poller = P2PQuakePoller(
+            session,
+            ingest,
+            setup_at=dt_util.utcnow(),
+            setup_during_startup=hass.state is not CoreState.running,
+            quake_ready=_quake_ready,
+            on_status=_on_rest_status,
+        )
     entry.runtime_data = runtime
 
     # 地図・対応表・フォントのファイルはイベントループの外で読んでおく
@@ -265,6 +338,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: P2PQuakeConfigEntry) -> 
 
     task.add_done_callback(_on_task_done)
     entry.async_on_unload(client.stop)
+
+    if (poller := runtime.poller) is not None:
+        poller_task = entry.async_create_background_task(
+            hass, poller.run(), f"{entry.domain}_rest"
+        )
+
+        @callback
+        def _on_poller_done(t: asyncio.Task[None]) -> None:
+            if t.cancelled() or poller.stopped:
+                return
+            _LOGGER.error(
+                "JSON API の取得タスクが予期せず終了しました。予備の受信ができません: %r",
+                t.exception(),
+            )
+            poller.alive = False
+            async_dispatcher_send(hass, SIGNAL_REST)
+
+        poller_task.add_done_callback(_on_poller_done)
+        entry.async_on_unload(poller.stop)
     entry.async_on_unload(entry.add_update_listener(_async_reload))
     return True
 

@@ -18,6 +18,8 @@ EVENT_QUAKE = "p2pquake_quake"
 CODE_QUAKE = 551
 
 SIGNAL_UPDATE = f"{DOMAIN}_update"
+# JSON API（予備の受信）の取得状態が変わったかもしれないとき
+SIGNAL_REST = f"{DOMAIN}_rest"
 
 # 警告画像（オプション）
 CONF_IMAGE = "image"

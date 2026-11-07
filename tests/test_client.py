@@ -88,14 +88,18 @@ async def test_dedup_reconnect_and_bad_frames():
         await run_for(c, 0.6)
     await runner.cleanup()
 
-    assert [m.get("_id") for m in received] == ["abc", "p1", "def"]
+    # 重複除去は ingest.py が行う。client は届いた dict をそのまま渡す（JSON でない・配列は捨てる）
+    # （再接続のたびに2つ目の組が繰り返し届くので、先頭の並びで確かめる）
+    ids = [m.get("_id") for m in received]
+    assert ids[:5] == ["abc", "abc", "p1", "abc", "def"]
+    assert set(ids) == {"abc", "p1", "def"}
     assert c.connect_count >= 2
     assert True in statuses and False in statuses
     assert c.connected is False
 
 
-async def test_callback_error_does_not_drop_connection_and_is_retried():
-    """callback が失敗した情報は「処理済み」にせず、再配信されたら再び処理する."""
+async def test_callback_error_does_not_drop_connection():
+    """callback が失敗しても接続は切れず、続く情報も届く（再配信の扱いは ingest.py）."""
     sent = {"n": 0}
 
     async def handler(request):

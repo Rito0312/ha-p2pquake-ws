@@ -20,11 +20,20 @@
 - 30秒ごとの ping で切れた接続を検出し、20分間データ（ping/pong 以外）が届かない場合も接続し直す
   （本番ではピア分布 code 555 が数分おきに届くため、20分の無音は配信停止とみなす）
 - 同じ情報の再配信を `id`／`_id` で取り除く（公式仕様で推奨されている処理）
+  - 対象は 556 と 551 だけ（揺れた報告 561 などが大量に届いても記録が押し出されない）。記録はオプション変更での読み込み直しをまたいで残る
+- JSON API（`/v2/history`）による予備の受信（本番のみ）
+  - 地震時に WebSocket の配信が数分遅れた例があったための予備。WebSocket と同じ重複除去・同じ処理を通り、先に届いた方だけを発火する（画像も作る）
+  - 556 は10秒ごと（速報が無ければ応答は2バイト）。551 は通常60秒ごと、新しい 551・556 を受け取ってから15分間は15秒ごと
+  - 古い情報は発火しない（統合の起動より前のもの、556 は10分・551 は30分より前のもの）。
+    ただし HA の起動中は、停止中・起動中に出た3分以内の緊急地震速報を発火する（起動完了の10秒後）
+  - HTTP 429・5xx のときだけ待ちを伸ばす（最大60秒、Retry-After に従う）。タイムアウトなどでは周期を保つ
+  - 1分あたり最大10回（公式の上限は60回/分/IP）
 - 556 を受信したら `p2pquake_eew` イベントを発火
   - HA の起動中（オートメーションの準備ができる前）に受信したものは保留し、起動完了の10秒後に発火する（受信から3分以内のもの）
 - 551（地震情報）を受信したら `p2pquake_quake` イベントを発火（HA の起動中に受信したものは発火しない）
 - エンティティ（センサーの状態が変わるのは接続・切断時と速報受信時だけ）
   - `binary_sensor.p2pquake_ws_connected`：接続中か
+  - `binary_sensor.p2pquake_ws_rest`：JSON API で緊急地震速報を取得できているか（直近60秒以内に成功していれば on。本番のみ）
   - `sensor.p2pquake_ws_last_eew`：最後に緊急地震速報を受信した時刻と概要（再起動後も保持）
 - 画像（オプション、既定でオン。PNG、1280×800）
   - `image.p2pquake_ws_eew_map`：556 を受信するたびに、地図（対象地域を予想震度で色分け、震源）と文字の画像を作る
@@ -68,6 +77,12 @@ recorder:
 | `_received_at` | HA が受信した時刻（UTC, ISO 8601） |
 | `_message_id` | 情報の識別子（WebSocket では `_id` で届く） |
 | `_endpoint` | `production` または `sandbox` |
+| `_source` | 受信した経路。`ws`（WebSocket）または `rest`（JSON API） |
+| `_p2p_delay` | P2P地震情報が情報を受け付けた時刻（`time`）から HA が受信するまでの秒数（`time` が読めないときは無い） |
+
+JSON API で届いた情報にも `_id` を付けています（WebSocket と同じ形）。
+同じ地震の古い報が後から届いた場合（経路の違いで順番が入れ替わった場合）、イベントは発火しますが、
+`sensor.p2pquake_ws_last_eew` と画像は新しい報のままにします。
 
 次のものも、そのまま流れてきます。オートメーション側で除外してください。
 
@@ -75,7 +90,7 @@ recorder:
 - `cancelled: true`：取消報（`earthquake` と `areas` が null）
 - `_endpoint: sandbox`：サンドボックスの再送データ（`test` は false のまま届く）
 
-`p2pquake_quake` のデータは、公式仕様の地震情報（code 551）そのままに、上の3つのキーと次のキーを追加しています。
+`p2pquake_quake` のデータは、公式仕様の地震情報（code 551）そのままに、上のキーと次のキーを追加しています。
 
 | キー | 内容 |
 |---|---|
@@ -164,7 +179,8 @@ HACS → カスタムリポジトリに `https://github.com/Rito0312/ha-p2pquake
 ## 注意
 
 - P2P地震情報の配信は無保証で、サーバーは冗長化されていません。障害中に出た情報は再配信されません。
-- WebSocket は IP アドレスあたり2接続までです。
+- WebSocket は IP アドレスあたり2接続までです。JSON API（`/v2/history`）は60リクエスト/分/IPまでです。
+- WebSocket と JSON API は同じサーバーです。サーバー自体が止まればどちらも届きません。
 - データ提供: [P2P地震情報](https://www.p2pquake.net/)
 
 ## 開発
@@ -172,7 +188,7 @@ HACS → カスタムリポジトリに `https://github.com/Rito0312/ha-p2pquake
 ```sh
 pip install -r requirements_test.txt
 python -m pytest tests/test_client.py tests/test_render.py  # 受信部分と画像（HA不要）
-python -m pytest tests/test_integration.py                 # pytest-homeassistant-custom-component が必要
+python -m pytest tests/test_integration.py tests/test_poller.py  # pytest-homeassistant-custom-component が必要
 ```
 
 2つのテストは別々に実行してください（HA のテスト環境が通信を禁止するため、受信部分のテストが失敗します）。

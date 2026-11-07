@@ -1,6 +1,7 @@
 """P2P地震情報 WebSocket クライアント（Home Assistant 非依存）.
 
-受信・再接続・重複除去だけを担当し、判定は呼び出し側（HAのオートメーション）に任せる。
+受信・再接続だけを担当する。重複除去は WebSocket と JSON API（REST）で共有するため
+ingest.py が行い、判定は呼び出し側（HAのオートメーション）に任せる。
 """
 from __future__ import annotations
 
@@ -98,7 +99,6 @@ class P2PQuakeClient:
         self._stable_after = stable_after
         self._handshake_timeout = handshake_timeout
         self._sleep = sleep
-        self._dedup = Deduplicator()
         self._stopped = False
         self.connected = False
         self.connect_count = 0
@@ -122,9 +122,9 @@ class P2PQuakeClient:
                 _LOGGER.exception("接続状態の通知に失敗")
 
     def handle_raw(self, raw: str) -> dict[str, Any] | None:
-        """1 フレーム分の文字列を処理する。新しい情報なら callback を呼び dict を返す.
+        """1 フレーム分の文字列を JSON として読み、dict なら callback に渡して返す.
 
-        callback が例外を投げた場合は「処理済み」にしないので、再配信されれば再び処理される。
+        重複除去はしない（呼び出し側の ingest.py が WebSocket と REST をまとめて行う）。
         """
         try:
             data = json.loads(raw)
@@ -133,11 +133,7 @@ class P2PQuakeClient:
             return None
         if not isinstance(data, dict):
             return None
-        key = message_id(data)
-        if self._dedup.seen(key):
-            return None
         self._on_message(data)
-        self._dedup.add(key)
         return data
 
     async def _receive_loop(self, ws: aiohttp.ClientWebSocketResponse) -> bool:

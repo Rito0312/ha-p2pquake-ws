@@ -45,6 +45,9 @@
     "binary_sensor": {
       "connected": {
         "name": "接続状態"
+      },
+      "rest": {
+        "name": "JSON API 取得"
       }
     },
     "button": {

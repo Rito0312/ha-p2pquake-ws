@@ -17,7 +17,7 @@ from custom_components.p2pquake_ws.const import (
     EVENT_EEW,
 )
 
-pytestmark = pytest.mark.usefixtures("enable_custom_integrations")
+pytestmark = pytest.mark.usefixtures("enable_custom_integrations", "no_rest")
 
 EEW = {
     "_id": "6ad19c93e88ee598246bf3ed",
@@ -31,6 +31,13 @@ EEW = {
 
 async def _never(self):
     await asyncio.Event().wait()
+
+
+@pytest.fixture
+def no_rest():
+    """JSON API の取得（予備の受信）は外へ出さない。必要なテストは process() を直接呼ぶ."""
+    with patch("custom_components.p2pquake_ws.poller.P2PQuakePoller.run", _never):
+        yield
 
 
 async def test_config_flow_and_single_instance(hass: HomeAssistant):
@@ -630,3 +637,262 @@ async def test_turning_image_off_removes_its_entities(hass: HomeAssistant):
             assert hass.states.get(entity_id) is None
         assert registry.async_get("binary_sensor.p2pquake_ws_connected") is not None
         assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+# --- JSON API（予備の受信）---------------------------------------------------
+
+
+def _p2p_now(seconds_ago: float = 0.0) -> str:
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+
+    from custom_components.p2pquake_ws.poller import JST
+
+    t = dt_util.utcnow() - timedelta(seconds=seconds_ago)
+    return t.astimezone(JST).strftime("%Y/%m/%d %H:%M:%S.%f")[:-3]
+
+
+def _rest_eew(id_: str = "6ad19c93e88ee598246bf3ed", serial: str = "1", ago: float = 2.0) -> dict:
+    """JSON API の形（識別子は id、_id は無い）."""
+    data = {k: v for k, v in EEW.items() if k != "_id"}
+    return {**data, "id": id_, "time": _p2p_now(ago), "issue": {**EEW["issue"], "serial": serial}}
+
+
+async def test_rest_eew_fires_once_with_source_and_image(hass: HomeAssistant):
+    """REST で先に届いた速報も WS と同じイベント・画像になり、後から WS で届いた同じ速報は捨てる."""
+    from homeassistant.util import dt as dt_util
+
+    entry = _entry(hass)
+    events = async_capture_events(hass, EVENT_EEW)
+    with patch("custom_components.p2pquake_ws.client.P2PQuakeClient.run", _never):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        runtime = entry.runtime_data
+        assert runtime.poller is not None
+        # setup より後の速報として扱う
+        runtime.poller._setup_at = dt_util.utcnow() - __import__("datetime").timedelta(minutes=1)
+
+        item = _rest_eew()
+        runtime.poller.process(556, [item])
+        await _wait_render(hass)
+        assert len(events) == 1
+        data = events[0].data
+        assert data["_source"] == "rest"
+        assert data["_message_id"] == item["id"] and data["_id"] == item["id"]
+        assert 0 <= data["_p2p_delay"] < 10
+        assert data["areas"][0]["name"] == "石狩地方中部"
+        assert hass.states.get("image.p2pquake_ws_eew_map").state not in ("unknown", "unavailable")
+        assert hass.states.get("sensor.p2pquake_ws_last_eew").attributes["event_id"] == "20261016123810"
+
+        # 同じ速報が WS から遅れて届く・REST で何度も返る → 発火しない
+        runtime.client.handle_raw(json.dumps({**item, "_id": item["id"]}))
+        runtime.poller.process(556, [item])
+        await hass.async_block_till_done()
+        assert len(events) == 1
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_ws_first_then_rest_is_ignored_and_old_serial_keeps_image(hass: HomeAssistant):
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+
+    entry = _entry(hass)
+    events = async_capture_events(hass, EVENT_EEW)
+    with patch("custom_components.p2pquake_ws.client.P2PQuakeClient.run", _never):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        runtime = entry.runtime_data
+        runtime.poller._setup_at = dt_util.utcnow() - timedelta(minutes=1)
+
+        # WS で第2報 → REST で同じ第2報（捨てる）と、遅れていた第1報（発火はするが画像は第2報のまま）
+        second = _rest_eew("id2", serial="2")
+        first = _rest_eew("id1", serial="1", ago=5)
+        runtime.client.handle_raw(json.dumps({**second, "_id": "id2"}))
+        await _wait_render(hass)
+        image_at = runtime.image_at
+        runtime.poller.process(556, [second, first])
+        await _wait_render(hass)
+        assert [e.data["_message_id"] for e in events] == ["id2", "id1"]
+        assert [e.data["_source"] for e in events] == ["ws", "rest"]
+        assert runtime.last_eew["issue"]["serial"] == "2"
+        assert runtime.image_at == image_at
+        assert hass.states.get("sensor.p2pquake_ws_last_eew").attributes["serial"] == "2"
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_rest_quake_has_area_scales(hass: HomeAssistant):
+    """実際の API 応答（茨城県沖、東京23区で震度2）で、REST 経路でも _area_scales が付く."""
+    import pathlib
+    from datetime import timedelta
+
+    from custom_components.p2pquake_ws.const import EVENT_QUAKE
+    from custom_components.p2pquake_ws.poller import parse_time
+
+    fixture = json.loads(
+        (pathlib.Path(__file__).parent / "fixtures/history_551_ibaraki.json").read_text("utf-8")
+    )
+    entry = _entry(hass)
+    quakes = async_capture_events(hass, EVENT_QUAKE)
+    with patch("custom_components.p2pquake_ws.client.P2PQuakeClient.run", _never):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        poller = entry.runtime_data.poller
+        newest = parse_time(fixture[0]["time"])
+        poller._setup_at = newest - timedelta(hours=1)
+        poller._now = lambda: newest + timedelta(seconds=30)
+        poller.process(551, fixture)
+        await _wait_render(hass)
+        assert [q.data["issue"]["type"] for q in quakes] == ["ScalePrompt", "Destination", "DetailScale"]
+        detail = quakes[-1].data
+        assert detail["_source"] == "rest"
+        assert detail["_area_scales"]["東京都２３区"] == 20
+        assert detail["_area_scales"]["東京都多摩東部"] == 10
+        assert hass.states.get("image.p2pquake_ws_quake_map").state not in ("unknown", "unavailable")
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_reload_keeps_dedup(hass: HomeAssistant):
+    """オプション変更で読み込み直しても、同じ速報を二重に発火しない."""
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+
+    entry = _entry(hass)
+    events = async_capture_events(hass, EVENT_EEW)
+    with patch("custom_components.p2pquake_ws.client.P2PQuakeClient.run", _never):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        item = _rest_eew()
+        entry.runtime_data.client.handle_raw(json.dumps({**item, "_id": item["id"]}))
+        await hass.async_block_till_done()
+        assert len(events) == 1
+
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+        poller = entry.runtime_data.poller
+        poller._setup_at = dt_util.utcnow() - timedelta(minutes=1)
+        poller.process(556, [item])
+        entry.runtime_data.client.handle_raw(json.dumps({**item, "_id": item["id"]}))
+        await hass.async_block_till_done()
+        assert len(events) == 1
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_startup_rest_eew_is_fired_after_started(hass: HomeAssistant):
+    """HA の停止中・起動中に出た速報（180 秒以内）を、起動時の REST 取得で拾い、起動後に発火する."""
+    from datetime import timedelta
+
+    from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+    from homeassistant.core import CoreState
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    hass.set_state(CoreState.starting)
+    entry = _entry(hass)
+    events = async_capture_events(hass, EVENT_EEW)
+    with patch("custom_components.p2pquake_ws.client.P2PQuakeClient.run", _never):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        poller = entry.runtime_data.poller
+        assert poller._setup_during_startup
+        poller.process(556, [_rest_eew("recent", ago=60), _rest_eew("old", ago=400)])
+        await hass.async_block_till_done()
+        assert events == []
+
+        hass.set_state(CoreState.running)
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+        await hass.async_block_till_done()
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=11))
+        await hass.async_block_till_done()
+        assert [e.data["_message_id"] for e in events] == ["recent"]
+        assert events[0].data["_source"] == "rest"
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_rest_health_sensor(hass: HomeAssistant):
+    """取得に成功してから 60 秒以内なら on。取得が止まれば 30 秒ごとの見直しで off になる."""
+    from datetime import timedelta
+
+    from homeassistant.helpers.dispatcher import async_dispatcher_send
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    from custom_components.p2pquake_ws.const import SIGNAL_REST
+
+    clock = {"t": 5000.0}
+    entry = _entry(hass)
+    with patch("custom_components.p2pquake_ws.client.P2PQuakeClient.run", _never), patch(
+        "custom_components.p2pquake_ws.binary_sensor.time.monotonic", lambda: clock["t"]
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert hass.states.get("binary_sensor.p2pquake_ws_rest").state == "off"  # まだ成功していない
+
+        writes = []
+        hass.bus.async_listen(
+            "state_changed",
+            lambda e: writes.append(1) if e.data["entity_id"] == "binary_sensor.p2pquake_ws_rest" else None,
+        )
+        poller = entry.runtime_data.poller
+        poller.last_success = clock["t"]
+        async_dispatcher_send(hass, SIGNAL_REST)
+        await hass.async_block_till_done()
+        assert hass.states.get("binary_sensor.p2pquake_ws_rest").state == "on"
+
+        # 成功が続く間（状態が変わらない間）は書き込まない
+        for _ in range(5):
+            clock["t"] += 10
+            poller.last_success = clock["t"]
+            async_dispatcher_send(hass, SIGNAL_REST)
+            async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=31))
+            await hass.async_block_till_done()
+        assert len(writes) == 1
+
+        # 取得が止まる（シグナルは来ない）→ タイマーの見直しで off
+        clock["t"] += 61
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=200))
+        await hass.async_block_till_done()
+        assert hass.states.get("binary_sensor.p2pquake_ws_rest").state == "off"
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_poller_task_crash_turns_health_off(hass: HomeAssistant, caplog):
+    async def _crash(self):
+        raise RuntimeError("boom")
+
+    entry = _entry(hass)
+    with patch("custom_components.p2pquake_ws.client.P2PQuakeClient.run", _never), patch(
+        "custom_components.p2pquake_ws.poller.P2PQuakePoller.run", _crash
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await asyncio.sleep(0.05)
+        await hass.async_block_till_done()
+        assert entry.runtime_data.poller.alive is False
+        assert "JSON API の取得タスクが予期せず終了しました" in caplog.text
+        assert hass.states.get("binary_sensor.p2pquake_ws_rest").state == "off"
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_sandbox_has_no_rest(hass: HomeAssistant):
+    entry = MockConfigEntry(domain=DOMAIN, data={CONF_ENDPOINT: ENDPOINT_SANDBOX})
+    entry.add_to_hass(hass)
+    with patch("custom_components.p2pquake_ws.client.P2PQuakeClient.run", _never):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert entry.runtime_data.poller is None
+        assert hass.states.get("binary_sensor.p2pquake_ws_rest") is None
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_unload_stops_poller(hass: HomeAssistant):
+    entry = _entry(hass)
+    with patch("custom_components.p2pquake_ws.client.P2PQuakeClient.run", _never):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        poller = entry.runtime_data.poller
+        assert await hass.config_entries.async_unload(entry.entry_id)
+        await hass.async_block_till_done()
+        assert poller.stopped
