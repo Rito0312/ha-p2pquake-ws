@@ -161,7 +161,9 @@ def test_items_before_setup_are_recorded_only_unless_startup_eew():
     p.process(556, [eew("e1", SETUP - timedelta(seconds=60))])
     p.process(551, [quake("q1", SETUP - timedelta(seconds=10))])
     assert rec.got == []
-    assert ing.known({"id": "e1"}) and ing.known({"id": "q1"})
+    # 見送ったものは Ingest に記録しない（WS で後から届いたら従来どおり発火する）
+    assert not ing.known({"id": "e1"}) and not ing.known({"id": "q1"})
+    assert ing.handle({"_id": "e1", "code": 556}, "ws")
 
     # HA の起動中の setup: 180 秒以内の緊急地震速報だけ発火に回す
     p, rec, _ = make(now, startup=True)
@@ -188,7 +190,10 @@ def test_unreadable_time_is_recorded_only_and_id_copied():
     now = SETUP + timedelta(minutes=1)
     p, rec, ing = make(now)
     p.process(556, [{"id": "e1", "code": 556, "time": "??"}])
-    assert rec.got == [] and ing.known({"id": "e1"})
+    p.process(556, [{"id": "e1", "code": 556, "time": "??"}])
+    assert rec.got == []
+    # 時刻の書式が変わっても、WS で届いた同じ速報は発火する（REST の見送りで WS を止めない）
+    assert ing.handle({"_id": "e1", "code": 556}, "ws")
     seen = []
     p._ingest = Ingest(Deduplicator(), lambda d, s: seen.append(d))
     p.process(556, [eew("e2", now)])
@@ -223,8 +228,10 @@ class FakeResp:
         self._exc = exc
         self.content = self
 
-    async def read(self, n):
-        return self._body[:n]
+    async def iter_any(self):
+        # 実際の通信と同じく、少しずつ届く
+        for i in range(0, len(self._body), 1000):
+            yield self._body[i : i + 1000]
 
     async def __aenter__(self):
         if self._exc:
@@ -262,6 +269,8 @@ async def test_fetch_validates_responses():
             FakeResp(body=b"[" + b" " * (poller_mod.MAX_BODY + 1) + b"]"),
             FakeResp(exc=TimeoutError()),
             FakeResp(exc=aiohttp.ClientConnectionError("x")),
+            FakeResp(exc=ConnectionResetError()),
+            FakeResp(body=b"[" * 100000 + b"]" * 100000),  # 深い入れ子（RecursionError）
         ]
     )
     p, _, _ = make(now, session=s)
@@ -274,7 +283,7 @@ async def test_fetch_validates_responses():
     with pytest.raises(FetchError) as err:
         await p.fetch(556, 10)
     assert err.value.retry_after == 0
-    for _ in range(8):
+    for _ in range(10):
         with pytest.raises(FetchError) as err:
             await p.fetch(556, 10)
         assert err.value.retry_after is None
@@ -383,3 +392,68 @@ async def test_quake_loop_waits_until_ready_and_stop_ends_run():
     assert any("codes=551&limit=3" in u for u in s.urls)
     p.stop()
     await asyncio.wait_for(task, 1)
+
+
+# --- レビューで見つかった不具合の再発防止 ------------------------------------------
+
+
+async def test_unexpected_error_keeps_loop_running(caplog):
+    clock = Clock()
+    calls = {"n": 0}
+
+    class Weird(FakeSession):
+        def get(self, url, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("session closed")
+            return FakeResp()
+
+    p, _, _ = make(SETUP, session=Weird([]), monotonic=clock.mono)
+
+    async def sleep(sec):
+        clock.waits.append(round(sec, 3))
+        if len(clock.waits) >= 2:
+            p.stop()
+
+    p._sleep = sleep
+    await p._loop(poller_mod._Loop(556, 10, "緊急地震速報"), lambda: 10.0)
+    assert calls["n"] == 2 and clock.waits == [10, 10]
+    assert "想定外のエラー" in caplog.text
+    assert p.last_success is not None
+
+
+async def test_run_stops_both_loops_if_one_dies():
+    p, _, _ = make(SETUP, session=FakeSession([]))
+    other_cancelled = asyncio.Event()
+
+    async def eew():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            other_cancelled.set()
+            raise
+
+    async def quake():
+        raise RuntimeError("boom")
+
+    p._run_eew = eew
+    p._run_quake = quake
+    with pytest.raises(BaseExceptionGroup):
+        await asyncio.wait_for(p.run(), 1)
+    assert other_cancelled.is_set()  # 管理外のループが残らない
+
+
+def test_resumed_setup_uses_normal_age_rule():
+    """再読み込み（記録を引き継いだ）なら、setup 直前の隙に出た速報も拾う."""
+    now = SETUP + timedelta(seconds=30)
+    p, rec, _ = make(now, resumed=True)
+    p.process(556, [eew("e1", SETUP - timedelta(seconds=20)), eew("e0", SETUP - timedelta(seconds=700))])
+    assert rec.got == [("e1", "rest")]
+
+
+def test_older_quake_is_not_shown_after_newer_one():
+    now = SETUP + timedelta(minutes=10)
+    p, rec, _ = make(now)
+    p.note_quake(quake("q2", SETUP + timedelta(minutes=5)))  # WS で新しい報を表示済み
+    p.process(551, [quake("q3", SETUP + timedelta(minutes=8)), quake("q1", SETUP + timedelta(minutes=3))])
+    assert rec.got == [("q3", "rest")]

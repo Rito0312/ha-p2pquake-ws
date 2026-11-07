@@ -25,7 +25,12 @@
   - 地震時に WebSocket の配信が数分遅れた例があったための予備。WebSocket と同じ重複除去・同じ処理を通り、先に届いた方だけを発火する（画像も作る）
   - 556 は10秒ごと（速報が無ければ応答は2バイト）。551 は通常60秒ごと、新しい 551・556 を受け取ってから15分間は15秒ごと
   - 古い情報は発火しない（統合の起動より前のもの、556 は10分・551 は30分より前のもの）。
-    ただし HA の起動中は、停止中・起動中に出た3分以内の緊急地震速報を発火する（起動完了の10秒後）
+    ただし HA の起動中は、停止中・起動中に出た3分以内の緊急地震速報を発火する（起動完了の10秒後）。
+    オプション変更での読み込み直しでは、その隙に出た情報も拾う
+  - REST で発火を見送った情報（古い・時刻が読めない）でも、WebSocket で届けば従来どおり発火する
+  - 地震情報は、表示済みの報より古い報を REST で後から発火しない（表示が古い報に戻らない）
+  - HA の再起動で重複除去の記録は消えるため、再起動の前に発火した3分以内の緊急地震速報がもう一度発火することがある。
+    オートメーション側で `issue.eventId` などを永続的に記録して重複を除いてください
   - HTTP 429・5xx のときだけ待ちを伸ばす（最大60秒、Retry-After に従う）。タイムアウトなどでは周期を保つ
   - 1分あたり最大10回（公式の上限は60回/分/IP）
 - 556 を受信したら `p2pquake_eew` イベントを発火
@@ -187,11 +192,11 @@ HACS → カスタムリポジトリに `https://github.com/Rito0312/ha-p2pquake
 
 ```sh
 pip install -r requirements_test.txt
-python -m pytest tests/test_client.py tests/test_render.py  # 受信部分と画像（HA不要）
-python -m pytest tests/test_integration.py tests/test_poller.py  # pytest-homeassistant-custom-component が必要
+python -m pytest tests/test_client.py tests/test_fetch_http.py -p no:homeassistant -p no:socket  # 受信部分（ローカルのサーバーを使う）
+python -m pytest tests/test_integration.py tests/test_poller.py tests/test_render.py  # pytest-homeassistant-custom-component が必要
 ```
 
-2つのテストは別々に実行してください（HA のテスト環境が通信を禁止するため、受信部分のテストが失敗します）。
+2つのテストは別々に実行してください（HA のテスト環境が通信を禁止するため、ローカルのサーバーを使うテストが失敗します）。
 
 ## ライセンス
 

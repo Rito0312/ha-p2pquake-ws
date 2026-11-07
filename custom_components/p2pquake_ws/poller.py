@@ -20,6 +20,7 @@ from typing import Any
 
 import aiohttp
 
+from .client import Deduplicator
 from .ingest import Ingest
 
 _LOGGER = logging.getLogger(__name__)
@@ -85,6 +86,7 @@ class P2PQuakePoller:
         *,
         setup_at: datetime,
         setup_during_startup: bool,
+        resumed: bool = False,
         quake_ready: Callable[[], Awaitable[None]] | None = None,
         on_status: Callable[[], None] | None = None,
         now: Callable[[], datetime] | None = None,
@@ -96,6 +98,12 @@ class P2PQuakePoller:
         self._ingest = ingest
         self._setup_at = setup_at
         self._setup_during_startup = setup_during_startup
+        # 重複除去の記録を引き継いだ（オプション変更での読み込み直し）。setup 前の情報も通常の年齢判定にする
+        self._resumed = resumed
+        # REST で発火を見送った要素（Ingest には記録しない。WS で後から届いた同じ情報は止めない）
+        self._skipped = Deduplicator(size=200)
+        self._time_warned = False
+        self.last_quake_time: datetime | None = None  # 発火済みの 551 の最新の time（古い報を後から出さない）
         self._quake_ready = quake_ready
         self._on_status = on_status
         self._now = now or (lambda: datetime.now(timezone.utc))
@@ -130,8 +138,13 @@ class P2PQuakePoller:
                 _LOGGER.exception("REST 取得状態の通知に失敗")
 
     async def run(self) -> None:
-        """stop() されるかキャンセルされるまで取得し続ける."""
-        await asyncio.gather(self._run_eew(), self._run_quake())
+        """stop() されるかキャンセルされるまで取得し続ける.
+
+        片方のループが想定外に終わったら、もう片方も止めて例外を上げる（呼び出し側が検知する）。
+        """
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(self._run_eew())
+            tg.create_task(self._run_quake())
 
     async def _run_eew(self) -> None:
         await self._loop(_Loop(556, EEW_LIMIT, "緊急地震速報"), lambda: EEW_INTERVAL)
@@ -150,9 +163,17 @@ class P2PQuakePoller:
                 items = await self.fetch(loop.code, loop.limit)
             except FetchError as err:
                 wait = self._on_failure(loop, err, wait)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001 - 想定外の例外でもループを止めない（周期は保つ）
+                _LOGGER.exception("P2P地震情報 JSON API（%s）の取得で想定外のエラー", loop.name)
+                wait = self._on_failure(loop, FetchError(repr(err)), wait, log=False)
             else:
                 self._on_success(loop)
-                self.process(loop.code, items)
+                try:
+                    self.process(loop.code, items)
+                except Exception:  # noqa: BLE001
+                    _LOGGER.exception("P2P地震情報 JSON API（%s）の処理で想定外のエラー", loop.name)
             if self._stopped:
                 return
             # 開始時刻を基準にした固定周期（取得にかかった時間を差し引く。前の取得とは重ならない）
@@ -170,14 +191,17 @@ class P2PQuakePoller:
             if first or was_failing:
                 self._status()
 
-    def _on_failure(self, loop: _Loop, err: FetchError, wait: float) -> float:
+    def _on_failure(
+        self, loop: _Loop, err: FetchError, wait: float, *, log: bool = True
+    ) -> float:
         loop.failures += 1
-        _LOGGER.log(
-            logging.WARNING if loop.failures == 1 else logging.DEBUG,
-            "P2P地震情報 JSON API（%s）の取得に失敗: %s",
-            loop.name,
-            err,
-        )
+        if log:
+            _LOGGER.log(
+                logging.WARNING if loop.failures == 1 else logging.DEBUG,
+                "P2P地震情報 JSON API（%s）の取得に失敗: %s",
+                loop.name,
+                err,
+            )
         if loop.code == 556:
             self._status()  # 状態センサーは時刻で判定する。ここでは見直しのきっかけだけ
         if err.retry_after is None:
@@ -200,16 +224,22 @@ class P2PQuakePoller:
                     )
                 if resp.status != 200:
                     raise FetchError(f"HTTP {resp.status}")
-                body = await resp.content.read(MAX_BODY + 1)
+                # read(n) は「届いている分だけ」を返すので、最後まで読む（上限を超えたら打ち切る）
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in resp.content.iter_any():
+                    size += len(chunk)
+                    if size > MAX_BODY:
+                        raise FetchError("応答が大きすぎます")
+                    chunks.append(chunk)
+                body = b"".join(chunks)
         except FetchError:
             raise
-        except (aiohttp.ClientError, TimeoutError) as err:
+        except (aiohttp.ClientError, TimeoutError, OSError) as err:
             raise FetchError(f"{type(err).__name__}: {err}") from err
-        if len(body) > MAX_BODY:
-            raise FetchError("応答が大きすぎます")
         try:
             data = json.loads(body)
-        except ValueError as err:
+        except (ValueError, RecursionError) as err:
             raise FetchError("JSON ではない応答") from err
         if not isinstance(data, list):
             raise FetchError("配列ではない応答")
@@ -222,12 +252,17 @@ class P2PQuakePoller:
         """取得した要素を古い順に、発火するか記録だけするかを決めて Ingest に渡す."""
         now = self._now()
         for item in reversed(items):  # 応答は新しい順。古い順に処理する
-            if self._ingest.known(item):
+            if self._ingest.known(item) or self._skipped.seen(item.get("id")):
                 continue
             when = parse_time(item.get("time"))
             if when is None:
-                _LOGGER.debug("時刻を読めない情報は発火しません: %s", item.get("id"))
-                self._ingest.mark_seen(item)
+                if not self._time_warned:
+                    self._time_warned = True
+                    _LOGGER.warning(
+                        "JSON API の時刻を読めない情報は発火しません（WebSocket では発火します）: %r",
+                        item.get("time"),
+                    )
+                self._skip(item)
                 continue
             age = (now - when).total_seconds()
             if age < -CLOCK_SKEW_WARN and not self._skew_warned:
@@ -235,7 +270,7 @@ class P2PQuakePoller:
                 _LOGGER.warning(
                     "P2P の時刻が HA の時計より %.0f 秒進んでいます。HA の時計を確認してください", -age
                 )
-            if when < self._setup_at:
+            if when < self._setup_at and not self._resumed:
                 fire = (
                     code == 556
                     and self._setup_during_startup
@@ -243,13 +278,26 @@ class P2PQuakePoller:
                 )
             else:
                 fire = age <= MAX_AGE[code]
+            if fire and code == 551 and self.last_quake_time is not None and when < self.last_quake_time:
+                # WS で新しい報を表示した後に、取りこぼしていた古い報を出さない（表示が古い報に戻る）
+                fire = False
             if not fire:
-                self._ingest.mark_seen(item)
+                self._skip(item)
                 continue
             data = dict(item)
             if "_id" not in data and data.get("id"):
                 data["_id"] = data["id"]  # WebSocket と同じ形にそろえる
             self._ingest.handle(data, "rest")
+
+    def _skip(self, item: dict[str, Any]) -> None:
+        """REST では発火しない。Ingest には記録しない（WS で届いた同じ情報は従来どおり発火する）."""
+        self._skipped.add(item.get("id"))
+
+    def note_quake(self, data: dict[str, Any]) -> None:
+        """551 が発火した（WS・REST どちらでも）。その time を覚える."""
+        when = parse_time(data.get("time"))
+        if when is not None and (self.last_quake_time is None or when > self.last_quake_time):
+            self.last_quake_time = when
 
 
 def _retry_after(value: str | None) -> float:

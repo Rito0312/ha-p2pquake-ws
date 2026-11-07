@@ -17,6 +17,10 @@ from custom_components.p2pquake_ws.const import (
     EVENT_EEW,
 )
 
+from custom_components.p2pquake_ws.poller import P2PQuakePoller
+
+_REAL_POLLER_RUN = P2PQuakePoller.run  # no_rest で差し替える前の本物
+
 pytestmark = pytest.mark.usefixtures("enable_custom_integrations", "no_rest")
 
 EEW = {
@@ -896,3 +900,43 @@ async def test_unload_stops_poller(hass: HomeAssistant):
         assert await hass.config_entries.async_unload(entry.entry_id)
         await hass.async_block_till_done()
         assert poller.stopped
+
+
+async def test_real_poller_loop_wiring(hass: HomeAssistant):
+    """実際の取得ループを動かす: 556 はすぐ、551 は HA の起動完了の後に取り始め、REST で届いた速報を発火する."""
+    from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+    from homeassistant.core import CoreState
+
+    hass.set_state(CoreState.starting)
+    entry = _entry(hass)
+    events = async_capture_events(hass, EVENT_EEW)
+    fetched: list[int] = []
+    item = _rest_eew("fresh", ago=1)
+
+    async def fake_fetch(self, code, limit):
+        fetched.append(code)
+        return [item] if code == 556 else []
+
+    with patch("custom_components.p2pquake_ws.client.P2PQuakeClient.run", _never), patch(
+        "custom_components.p2pquake_ws.poller.P2PQuakePoller.run", _REAL_POLLER_RUN
+    ), patch("custom_components.p2pquake_ws.poller.P2PQuakePoller.fetch", fake_fetch):
+        # 各ループの1回目の取得はすぐ行われる（次の取得までの10秒・60秒はこのテストでは待たない）
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await asyncio.sleep(0.05)
+        assert 556 in fetched and 551 not in fetched  # 起動中は 551 を取らない
+
+        hass.set_state(CoreState.running)
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+        await asyncio.sleep(0.05)
+        assert 551 in fetched
+        # 起動中に REST で受けた速報（setup 後のもの）は起動完了の10秒後に発火する
+        from datetime import timedelta
+
+        from homeassistant.util import dt as dt_util
+        from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=11))
+        await hass.async_block_till_done(wait_background_tasks=False)
+        assert [e.data["_message_id"] for e in events] == ["fresh"]
+        assert entry.runtime_data.poller.last_success is not None
+        assert await hass.config_entries.async_unload(entry.entry_id)

@@ -235,13 +235,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: P2PQuakeConfigEntry) -> 
         async_dispatcher_send(hass, SIGNAL_UPDATE)
 
     @callback
-    def _on_new(_data: dict[str, Any], _source: str) -> None:
+    def _on_new(data: dict[str, Any], _source: str) -> None:
         if runtime.poller is not None:
             runtime.poller.notify_activity()
+            if data.get("code") == CODE_QUAKE:
+                runtime.poller.note_quake(data)
 
-    # 重複除去の記録は再読み込み（オプション変更）をまたいで残す（同じ速報を二重に発火しない）
+    # 重複除去の記録と、緊急地震速報の serial は、再読み込み（オプション変更）をまたいで残す
+    # （同じ速報を二重に発火しない。古い報で画像を戻さない）
     domain_data = hass.data.setdefault(DOMAIN, {})
+    resumed = "dedup" in domain_data
     dedup = domain_data.setdefault("dedup", Deduplicator())
+    eew_serials = domain_data.setdefault("eew_serials", {})
     ingest = Ingest(dedup, _on_message, _on_new)
 
     session = async_get_clientsession(hass)
@@ -255,6 +260,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: P2PQuakeConfigEntry) -> 
         image_option=image_option,
         image_enabled=image_option,
         home_area=str(entry.options.get(CONF_HOME_AREA) or ""),
+        eew_serials=eew_serials,
     )
     runtime.render_eew = _render_eew
     if endpoint == ENDPOINT_PRODUCTION:
@@ -272,6 +278,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: P2PQuakeConfigEntry) -> 
             ingest,
             setup_at=dt_util.utcnow(),
             setup_during_startup=hass.state is not CoreState.running,
+            resumed=resumed,
             quake_ready=_quake_ready,
             on_status=_on_rest_status,
         )
